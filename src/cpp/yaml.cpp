@@ -29,33 +29,86 @@ Local<String> emitter_error(yaml_emitter_t *emitter, yaml_event_t *event) {
         return String::New(msg.c_str());
 }
 
-typedef struct Chunk {
-        struct Chunk *next;
-        unsigned char *data;
-        size_t size;
-} Chunk;
 
-typedef struct {
+/*
+ * Used to build/manage the yaml string outside the v8 heap
+ */
+class YamlStringBuilder : public String::ExternalStringResource {
+private:
+        struct Chunk {
+                Chunk *next;
+                unsigned char *data;
+                size_t size;
+        };
+        uint16_t *str;
+        size_t str_len;
+        size_t total_size;
         Chunk *head;
         Chunk *tail;
-        size_t total;
-} Chunks;
 
-int append_chunk(void *list, unsigned char *buffer, size_t size) {
-        Chunks *chunks = (Chunks *)list;
-        Chunk *chunk = (Chunk *)malloc(sizeof(Chunk));
-        chunk->data = (unsigned char*)malloc(size);
-        chunk->next = NULL;
-        memcpy(chunk->data, buffer, size);
-        chunk->size = size;
-        if (!chunks->head) {
-                chunks->head = chunk;
-                chunks->tail = chunk;
-        } else {
-                chunks->tail->next = chunk;
-                chunks->tail = chunk;
+public:
+        YamlStringBuilder() {
+                str = NULL;
+                str_len = 0;
+                total_size = 0;
+                head = NULL;
+                tail = NULL;
         }
-        chunks->total += size;
+
+        ~YamlStringBuilder() {
+                free(str);
+        }
+
+        void build() {
+                if (str == NULL) {
+                        // concatenate chunks and return the result
+                        str = (uint16_t *)malloc(total_size);        
+                        unsigned char *pos = (unsigned char *)str;
+                        Chunk *current = head;
+                        Chunk *next;
+                        while (current != NULL) {
+                                memcpy(pos, current->data, current->size);
+                                pos += current->size;
+                                next = current->next;
+                                // no need to keep the individual chunks
+                                free(current);
+                                current = next;
+                        }
+                        str_len = total_size / 2;
+                        head = NULL;
+                        tail = NULL;
+                }
+        }
+
+        const uint16_t* data() const {
+                return str;
+        }
+
+        size_t length() const {
+                return str_len;
+        }
+
+        void append(unsigned char *buffer, size_t size) {
+                Chunk *chunk = new Chunk();
+                chunk->data = (unsigned char*)malloc(size);
+                chunk->next = NULL;
+                memcpy(chunk->data, buffer, size);
+                chunk->size = size;
+                if (head == NULL) {
+                        head = chunk;
+                        tail = chunk;
+                } else {
+                        tail->next = chunk;
+                        tail = chunk;
+                }
+                total_size += size;
+        }
+};
+
+
+int append_wrapper(void *b, unsigned char *buffer, size_t size) {
+        YamlStringBuilder *builder = (YamlStringBuilder *)b;
+        builder->append(buffer, size);
         return 1;
 }
 
@@ -81,7 +134,6 @@ inline bool stringify_scalar(Local<Value> value, yaml_emitter_t *emitter,
         } else if (value->IsDate()) {
                 tag = YAML_TIMESTAMP_TAG;
         }
-
         if (tag) {
                 String::Utf8Value str(value);
                 yaml_scalar_event_initialize(event, NULL,
@@ -147,7 +199,7 @@ inline void stringify_object(Local<Object> obj, yaml_emitter_t *emitter,
 inline void emit_yaml_events(Local<Value> value, yaml_emitter_t *emitter,
                 yaml_event_t *event) {
         // STREAM-START/DOCUMENT-START events
-        yaml_stream_start_event_initialize(event, YAML_UTF8_ENCODING);
+        yaml_stream_start_event_initialize(event, YAML_UTF16LE_ENCODING);
         if (!yaml_emitter_emit(emitter, event))
                 throw emitter_error(emitter, event);
         yaml_document_start_event_initialize(event, NULL, NULL, NULL, 1);
@@ -170,35 +222,21 @@ inline void emit_yaml_events(Local<Value> value, yaml_emitter_t *emitter,
 // Accepts a javascript object and returns a string containing the result
 Handle<Value> stringify(const Arguments& args) {
         HandleScope scope;
-        Chunks chunks = { NULL, NULL, 0 };
+        YamlStringBuilder *builder = new YamlStringBuilder();
         yaml_emitter_t emitter;
         yaml_event_t event;
         yaml_emitter_initialize(&emitter);
-        yaml_emitter_set_encoding(&emitter, YAML_UTF8_ENCODING);
-        yaml_emitter_set_output(&emitter, &append_chunk, &chunks);
+        yaml_emitter_set_encoding(&emitter, YAML_UTF16LE_ENCODING);
+        yaml_emitter_set_output(&emitter, &append_wrapper, builder);
         try {
                 emit_yaml_events(args[0], &emitter, &event);
         } catch (Local<String> msg) {
                 yaml_emitter_delete(&emitter);
                 return ThrowException(Exception::Error(msg));
         }
-        // concatenate chunks that will be copied into a v8 string
-        unsigned char *temp = (unsigned char*)malloc(chunks.total);        
-        unsigned char *pos = temp;
-        Chunk *current = chunks.head;
-        Chunk *next;
-        while (current != NULL) {
-                memcpy(pos, current->data, current->size);
-                pos += current->size;
-                next = current->next;
-                free(current);
-                current = next;
-        }
-        assert(chunks.total == (size_t)(pos - temp));
-        Local<String> rv = String::New((const char*)temp, chunks.total);
-        free(temp);
         yaml_emitter_delete(&emitter);
-        return scope.Close(rv);
+        builder->build();
+        return scope.Close(String::NewExternal(builder));
 }
 
 // Accepts a javascript string and returns the parsed object
