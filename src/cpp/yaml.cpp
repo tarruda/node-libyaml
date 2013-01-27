@@ -62,9 +62,11 @@ int append_chunk(void *list, unsigned char *buffer, size_t size) {
 inline void stringify_object(Local<Object> obj, yaml_emitter_t *emitter,
                 yaml_event_t *event, bool isArray);
 
-void stringify_value(Local<Value> value, yaml_emitter_t *emitter,
+
+inline bool stringify_scalar(Local<Value> value, yaml_emitter_t *emitter,
                 yaml_event_t *event) {
         const char *tag = NULL;
+        yaml_scalar_style_e style = YAML_PLAIN_SCALAR_STYLE;
         if (value->IsNull() || value->IsUndefined()) {
                 tag = YAML_NULL_TAG;
         } else if (value->IsBoolean() || value->IsBooleanObject()) {
@@ -85,10 +87,17 @@ void stringify_value(Local<Value> value, yaml_emitter_t *emitter,
                 yaml_scalar_event_initialize(event, NULL,
                                 (yaml_char_t *)tag,
                                 (yaml_char_t *)*str, str.length(),
-                                1, 1, YAML_PLAIN_SCALAR_STYLE);
+                                1, 1, style);
                 if (!yaml_emitter_emit(emitter, event))
                         throw emitter_error(emitter, event);
-        } else if (value->IsArray()) {
+                return true;
+        }
+        return false;
+}
+
+void stringify_value(Local<Value> value, yaml_emitter_t *emitter,
+                yaml_event_t *event) {
+        if (!stringify_scalar(value, emitter, event) && value->IsArray()) {
                 yaml_sequence_start_event_initialize(event, NULL,
                                 (yaml_char_t *)YAML_SEQ_TAG, 1,
                                 YAML_BLOCK_SEQUENCE_STYLE);
@@ -141,13 +150,13 @@ inline void emit_yaml_events(Local<Value> value, yaml_emitter_t *emitter,
         yaml_stream_start_event_initialize(event, YAML_UTF8_ENCODING);
         if (!yaml_emitter_emit(emitter, event))
                 throw emitter_error(emitter, event);
-        yaml_document_start_event_initialize(event, NULL, NULL, NULL, 0);
+        yaml_document_start_event_initialize(event, NULL, NULL, NULL, 1);
         if (!yaml_emitter_emit(emitter, event))
                 throw emitter_error(emitter, event);
         // transverse object
         stringify_value(value, emitter, event);
         // DOCUMENT-END/STREAM-END events
-        yaml_document_end_event_initialize(event, 0);
+        yaml_document_end_event_initialize(event, 1);
         if (!yaml_emitter_emit(emitter, event))
                 throw emitter_error(emitter, event);
         yaml_stream_end_event_initialize(event);
@@ -188,12 +197,19 @@ Handle<Value> stringify(const Arguments& args) {
         assert(chunks.total == (size_t)(pos - temp));
         Local<String> rv = String::New((const char*)temp, chunks.total);
         free(temp);
+        yaml_emitter_delete(&emitter);
         return scope.Close(rv);
+}
+
+// Accepts a javascript string and returns the parsed object
+Handle<Value> parse(const Arguments& args) {
+        HandleScope scope;
+
 }
 
 void init(Handle<Object> target) {
         NODE_SET_METHOD(target, "stringify", stringify);
-        /* NODE_SET_METHOD(target, "parse", ); */
+        NODE_SET_METHOD(target, "parse", parse);
 }
 
 NODE_MODULE(binding, init);
