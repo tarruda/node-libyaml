@@ -23,6 +23,7 @@ testDoc = {
         ]
       }
     ]
+  date: new Date(0)
 }
 
 suite 'object serialization/deserialization', ->

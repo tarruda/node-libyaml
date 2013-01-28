@@ -56,11 +56,13 @@ public:
         }
 
         ~YamlStringBuilder() {
-                free(str);
+                build();
+                if (str != NULL)
+                        free(str);
         }
 
         void build() {
-                if (str == NULL) {
+                if (head != NULL) {
                         // concatenate chunks and return the result
                         str = (uint16_t *)malloc(total_size);        
                         unsigned char *pos = (unsigned char *)str;
@@ -112,11 +114,13 @@ int append_wrapper(void *b, unsigned char *buffer, size_t size) {
         return 1;
 }
 
-inline void stringify_object(Local<Object> obj, yaml_emitter_t *emitter,
+inline void stringify_object(Local<Function> scalarProcessor,
+                Local<Object> obj, yaml_emitter_t *emitter,
                 yaml_event_t *event, bool isArray);
 
 
-inline bool stringify_scalar(Local<Value> value, yaml_emitter_t *emitter,
+inline bool stringify_scalar(Local<Function> scalarProcessor,
+                Local<Value> value, yaml_emitter_t *emitter,
                 yaml_event_t *event) {
         const char *tag = NULL;
         yaml_scalar_style_e style = YAML_PLAIN_SCALAR_STYLE;
@@ -131,14 +135,27 @@ inline bool stringify_scalar(Local<Value> value, yaml_emitter_t *emitter,
                 tag = YAML_FLOAT_TAG;
         } else if (value->IsString() || value->IsStringObject()) {
                 tag = YAML_STR_TAG;
+                Local<Value> args[1] = { value };
+                Local<Value> quoteType = scalarProcessor->Call(
+                                Context::GetCurrent()->Global(),
+                                1, args);
+                if (quoteType->IsTrue())
+                        style = YAML_SINGLE_QUOTED_SCALAR_STYLE;
+                else if (quoteType->IsFalse())
+                        style = YAML_DOUBLE_QUOTED_SCALAR_STYLE;
         } else if (value->IsDate()) {
                 tag = YAML_TIMESTAMP_TAG;
+                Local<Value> args[1] = { value };
+                value = scalarProcessor->Call(
+                                Context::GetCurrent()->Global(),
+                                1, args);
         }
         if (tag) {
-                String::Utf8Value str(value);
+                String::Utf8Value utf8Str(value);
+                /* std::cout << *utf8Str << "\n"; */
                 yaml_scalar_event_initialize(event, NULL,
                                 (yaml_char_t *)tag,
-                                (yaml_char_t *)*str, str.length(),
+                                (yaml_char_t *)*utf8Str, utf8Str.length(),
                                 1, 1, style);
                 if (!yaml_emitter_emit(emitter, event))
                         throw emitter_error(emitter, event);
@@ -147,35 +164,40 @@ inline bool stringify_scalar(Local<Value> value, yaml_emitter_t *emitter,
         return false;
 }
 
-void stringify_value(Local<Value> value, yaml_emitter_t *emitter,
+void stringify_value(Local<Function> scalarProcessor,
+                Local<Value> value, yaml_emitter_t *emitter,
                 yaml_event_t *event) {
-        if (!stringify_scalar(value, emitter, event) && value->IsArray()) {
+        if (!stringify_scalar(scalarProcessor, value, emitter, event) &&
+                        value->IsArray()) {
                 yaml_sequence_start_event_initialize(event, NULL,
                                 (yaml_char_t *)YAML_SEQ_TAG, 1,
                                 YAML_BLOCK_SEQUENCE_STYLE);
                 if (!yaml_emitter_emit(emitter, event))
                         throw emitter_error(emitter, event);
-                stringify_object(value->ToObject(), emitter, event, true);
+                stringify_object(scalarProcessor,
+                                value->ToObject(), emitter, event, true);
                 yaml_sequence_end_event_initialize(event);
                 if (!yaml_emitter_emit(emitter, event))
                         throw emitter_error(emitter, event);
         } else if (value->IsObject() && !value->IsFunction() &&
-                        !value->IsRegExp()) {
+                        !value->IsRegExp() && !value->IsDate()) {
                 yaml_mapping_start_event_initialize(event, NULL,
                                 (yaml_char_t *)YAML_MAP_TAG, 1,
                                 YAML_BLOCK_MAPPING_STYLE);
                 if (!yaml_emitter_emit(emitter, event))
                         throw emitter_error(emitter, event);
-                stringify_object(value->ToObject(), emitter, event, false);
+                stringify_object(scalarProcessor,
+                                value->ToObject(), emitter, event, false);
                 yaml_mapping_end_event_initialize(event);
                 if (!yaml_emitter_emit(emitter, event))
                         throw emitter_error(emitter, event);
         }
 }
 
-inline void stringify_object(Local<Object> obj, yaml_emitter_t *emitter,
+inline void stringify_object(Local<Function> scalarProcessor,
+                Local<Object> obj, yaml_emitter_t *emitter,
                 yaml_event_t *event, bool isArray) {
-        const Local<Array> props = obj->GetPropertyNames();
+        const Local<Array> props = obj->GetOwnPropertyNames();
         const uint32_t length = props->Length();
         for (uint32_t i=0 ; i<length ; ++i) {
                 const Local<Value> key = props->Get(i);
@@ -192,11 +214,12 @@ inline void stringify_object(Local<Object> obj, yaml_emitter_t *emitter,
 
                 }
                 const Local<Value> child = obj->Get(key);
-                stringify_value(child, emitter, event);
+                stringify_value(scalarProcessor, child, emitter, event);
         }
 }
 
-inline void emit_yaml_events(Local<Value> value, yaml_emitter_t *emitter,
+inline void emit_yaml_events(Local<Function> scalarProcessor,
+                Local<Value> value, yaml_emitter_t *emitter,
                 yaml_event_t *event) {
         // STREAM-START/DOCUMENT-START events
         yaml_stream_start_event_initialize(event, YAML_UTF16LE_ENCODING);
@@ -206,7 +229,7 @@ inline void emit_yaml_events(Local<Value> value, yaml_emitter_t *emitter,
         if (!yaml_emitter_emit(emitter, event))
                 throw emitter_error(emitter, event);
         // transverse object
-        stringify_value(value, emitter, event);
+        stringify_value(scalarProcessor, value, emitter, event);
         // DOCUMENT-END/STREAM-END events
         yaml_document_end_event_initialize(event, 1);
         if (!yaml_emitter_emit(emitter, event))
@@ -229,8 +252,10 @@ Handle<Value> stringify(const Arguments& args) {
         yaml_emitter_set_encoding(&emitter, YAML_UTF16LE_ENCODING);
         yaml_emitter_set_output(&emitter, &append_wrapper, builder);
         try {
-                emit_yaml_events(args[0], &emitter, &event);
+                emit_yaml_events(Local<Function>::Cast(args[1]),
+                                args[0], &emitter, &event);
         } catch (Local<String> msg) {
+                delete builder;
                 yaml_emitter_delete(&emitter);
                 return ThrowException(Exception::Error(msg));
         }
