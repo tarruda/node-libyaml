@@ -152,7 +152,8 @@ inline bool stringify_scalar(Local<Function> scalarProcessor,
         }
         if (tag) {
                 String::Utf8Value utf8Str(value);
-                /* std::cout << *utf8Str << "\n"; */
+                if (utf8Str.length() > 50)
+                        style = YAML_LITERAL_SCALAR_STYLE;
                 yaml_scalar_event_initialize(event, NULL,
                                 (yaml_char_t *)tag,
                                 (yaml_char_t *)*utf8Str, utf8Str.length(),
